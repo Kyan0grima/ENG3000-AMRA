@@ -34,11 +34,11 @@
 #define CTRL_BIT   PD6  //D6
 
 
-int MAX_SPEED = 2800; /* ticks/sec ceiling - do not exceed */
+int MAX_SPEED = 900; /* rpm ceiling - do not exceed */
 
 
-int turning = 0;
-uint32_t turnStart = 0;
+int turnCounter = 0;
+int8_t turnDist = 0;
 
 
 /* ======================= Sensors ================================ */
@@ -219,8 +219,8 @@ int64_t sum = 0;
 
 
 static int32_t computeLinePosition(void) {
-    static const int32_t weight[8] = { -3500, -2500, -1500, -500,
-                                         500,  1500,  2500,  3500 };
+    static const int32_t weight[8] = { 3500, 2500, 1500, 500,
+                                         -500,  -1500,  -2500,  -3500 };
     int64_t weightedSum = 0;
     sum = 0;
 
@@ -302,16 +302,32 @@ static float clampf(float v, float lo, float hi) {
     return v;
 }
 
+static void turn(float radius, float speed, int dir, float angle, float *leftSpeed, float *rightSpeed, int8_t *dist){
+//dir 0 = right, 1 = left
+    if (dir == 0){
+        *leftSpeed = speed;
+        *rightSpeed = (*leftSpeed)*((2*radius-90.4)/(2*radius+90.4));
+    } else if (dir == 1){
+        *rightSpeed = speed;
+        *leftSpeed = (*rightSpeed)*((2*radius-90.4)/(2*radius+90.4));
+    }
+    
+    clampf(*rightSpeed, 0.0, 900.0);
+    clampf(*leftSpeed, 0.0, 900.0);
+    
+    *dist = (int)((radius+(90.4/2.0))*(angle*(3.14159/180.0)));
+}
+
 
 /* ---- Outer loop: line position -> steering correction (ticks/sec) ---
  * Setpoint is always 0 (computeLinePosition() already returns signed
  * error, positive = line to the right of the weight array's zero).
  * TUNE THESE on the real robot. */
-#define LINE_KP                1.5f
+#define LINE_KP                2.0f
 #define LINE_KI                0.1f
-#define LINE_KD                1.5f
-#define LINE_INTEGRAL_LIMIT    2600.0f
-#define LINE_CORRECTION_LIMIT  1900.0f  /* clamps how hard steering can pull L/R apart */
+#define LINE_KD                0.4f
+#define LINE_INTEGRAL_LIMIT    2500.0f
+#define LINE_CORRECTION_LIMIT  700.0f  /* clamps how hard steering can pull L/R apart */
 
 
 static pid_t linePID = { LINE_KP, LINE_KI, LINE_KD, 0.0f, LINE_INTEGRAL_LIMIT, 0.0f };
@@ -320,8 +336,8 @@ static pid_t linePID = { LINE_KP, LINE_KI, LINE_KD, 0.0f, LINE_INTEGRAL_LIMIT, 0
 /* ---- Inner loop: per-wheel speed (ticks/sec) -> PWM duty (0-255) ----
  * TUNE THESE too - start with Kp only, add Ki once proportional-only
  * settles near target but with steady-state error. */
-#define SPEED_KP               0.08f
-#define SPEED_KI               0.1f
+#define SPEED_KP               4.0f
+#define SPEED_KI               1.8f
 #define SPEED_KD               0.0f
 #define SPEED_INTEGRAL_LIMIT   150.0f
 
@@ -379,34 +395,55 @@ int main(void) {
         last_speed_time = now;
         update_motor_distances();
 
-        if (sum<6000){MAX_SPEED = 1800;} else {MAX_SPEED = 3000;}
 
 
         /* --- Outer loop: line position -> steering correction --- */
         float correction = pid_update(&linePID, (float)error, dt);
         correction = clampf(correction, -LINE_CORRECTION_LIMIT, LINE_CORRECTION_LIMIT);
 
+ 
 
         float targetL = clampf((float)MAX_SPEED - correction, 0.0f, (float)MAX_SPEED);
         float targetR = clampf((float)MAX_SPEED + correction, 0.0f, (float)MAX_SPEED);
 
+        // if (turnCounter == 0 && car_dist_mm > 420) {
+        //     float n, n2;
+        //     turn(10.0, 100.0, 1, 90.0, &n, &n2, &turnDist);
+
+        //     if (car_dist_mm < (420 + 220)) {
+        //         turn(10.0, 100.0, 1, 90.0, &targetL, &targetR, &turnDist);
+        //     } else {
+        //         turnCounter = 1;   // only mark the turn done once it's actually finished
+        //     }
+        // } else if (turnCounter == 1 && car_dist_mm > (420 + 220)) {
+        //     float n, n2;
+        //     turn(10.0, 100.0, 0, 90.0, &n, &n2, &turnDist);
+
+        //     if (car_dist_mm < (640+220)) {
+        //         turn(10.0, 100.0, 0, 90.0, &targetL, &targetR, &turnDist);
+        //     } else {
+        //         turnCounter = 2;   // only mark the turn done once it's actually finished
+        //     }
+        // }
+
+        targetL = targetR = 500;
 
         /* --- Inner loop: target speed -> PWM duty, per wheel --- */
-        float dutyL = pid_update(&speedPID_L, targetL - (float)motor1_speed, dt);
-        float dutyR = pid_update(&speedPID_R, targetR - (float)motor2_speed, dt);
+        float dutyL = pid_update(&speedPID_L, targetL - motor1_speed_rpm, dt);
+        float dutyR = pid_update(&speedPID_R, targetR - motor2_speed_rpm, dt);
 
 
         uint8_t pwmL = (uint8_t)clampf(dutyL, 0.0f, 255.0f);
         uint8_t pwmR = (uint8_t)clampf(dutyR, 0.0f, 255.0f);
-        //if ((40 < car_dist && car_dist < 90) || (360 < car_dist && car_dist < 430) || (500 < car_dist && car_dist < 580)) {MAX_SPEED = 2600;} else {MAX_SPEED = 3100;}
+
 
 
         forward(pwmL, pwmR);
 
 
-        printf("err: %ld\tdist: %u\tspeed: %u\n",
+        printf("speed: %d \tspeed2: %d\n",
            
-            error, car_dist, MAX_SPEED);
+            (int)motor1_speed_rpm, (int)motor2_speed_rpm);
 
 
         _delay_ms(20);
