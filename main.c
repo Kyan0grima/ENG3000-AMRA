@@ -34,7 +34,9 @@
 #define CTRL_BIT   PD6  //D6
 
 
-int MAX_SPEED = 300; /* rpm ceiling - do not exceed */
+int MAX_SPEED = 800; /* rpm ceiling - do not exceed */
+int TARGET_SPEED = 800; /* rpm ceiling - do not exceed */
+
 
 
 int turnCounter = 0;
@@ -318,14 +320,23 @@ static void turn(float radius, float speed, int dir, float angle, float *leftSpe
     *dist = (int)((radius+(90.4/2.0))*(angle*(3.14159/180.0)));
 }
 
+static void decel(float triggerDist, float decelDist, float minSpeed, float startSpeed){
+    float into = car_dist_mm - triggerDist;
+    if (into > 0 && into < decelDist){
+        float frac = into / decelDist;   // 0 at trigger, 1 at end of zone
+        TARGET_SPEED = clampf(startSpeed + (minSpeed - startSpeed) * frac,
+                              minSpeed, MAX_SPEED);
+    }
+}
+
 
 /* ---- Outer loop: line position -> steering correction (ticks/sec) ---
  * Setpoint is always 0 (computeLinePosition() already returns signed
  * error, positive = line to the right of the weight array's zero).
  * TUNE THESE on the real robot. */
 #define LINE_KP                3.0f
-#define LINE_KI                0.1f
-#define LINE_KD                0.4f
+#define LINE_KI                1.0f
+#define LINE_KD                0.0f
 #define LINE_INTEGRAL_LIMIT    800.0f
 #define LINE_CORRECTION_LIMIT  700.0f  /* clamps how hard steering can pull L/R apart */
 
@@ -401,10 +412,12 @@ int main(void) {
         float correction = pid_update(&linePID, (float)error, dt);
         correction = clampf(correction, -LINE_CORRECTION_LIMIT, LINE_CORRECTION_LIMIT);
 
- 
+        decel(200, 200, 100, MAX_SPEED); 
 
-        float targetL = clampf((float)MAX_SPEED - correction, 0.0f, (float)MAX_SPEED);
-        float targetR = clampf((float)MAX_SPEED + correction, 0.0f, (float)MAX_SPEED);
+        correction = clampf(correction, -TARGET_SPEED, TARGET_SPEED);
+
+        float targetL = clampf((float)TARGET_SPEED - correction, 0.0f, (float)MAX_SPEED);
+        float targetR = clampf((float)TARGET_SPEED + correction, 0.0f, (float)MAX_SPEED);
 
         // if (turnCounter == 0 && car_dist_mm > 420) {
         //     float n, n2;
