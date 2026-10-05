@@ -34,7 +34,7 @@
 #define CTRL_BIT   PD6  //D6
 
 
-int MAX_SPEED = 900; /* rpm ceiling - do not exceed */
+int MAX_SPEED = 800; /* rpm ceiling - do not exceed */
 
 
 int turnCounter = 0;
@@ -323,10 +323,10 @@ static void turn(float radius, float speed, int dir, float angle, float *leftSpe
  * Setpoint is always 0 (computeLinePosition() already returns signed
  * error, positive = line to the right of the weight array's zero).
  * TUNE THESE on the real robot. */
-#define LINE_KP                2.0f
+#define LINE_KP                3.0f
 #define LINE_KI                0.1f
 #define LINE_KD                0.4f
-#define LINE_INTEGRAL_LIMIT    2500.0f
+#define LINE_INTEGRAL_LIMIT    800.0f
 #define LINE_CORRECTION_LIMIT  700.0f  /* clamps how hard steering can pull L/R apart */
 
 
@@ -336,8 +336,8 @@ static pid_t linePID = { LINE_KP, LINE_KI, LINE_KD, 0.0f, LINE_INTEGRAL_LIMIT, 0
 /* ---- Inner loop: per-wheel speed (ticks/sec) -> PWM duty (0-255) ----
  * TUNE THESE too - start with Kp only, add Ki once proportional-only
  * settles near target but with steady-state error. */
-#define SPEED_KP               4.0f
-#define SPEED_KI               1.8f
+#define SPEED_KP               3.5f
+#define SPEED_KI               3.0f
 #define SPEED_KD               0.0f
 #define SPEED_INTEGRAL_LIMIT   150.0f
 
@@ -426,7 +426,7 @@ int main(void) {
         //     }
         // }
 
-        targetL = targetR = 500;
+        //targetL = targetR = 500;
 
         /* --- Inner loop: target speed -> PWM duty, per wheel --- */
         float dutyL = pid_update(&speedPID_L, targetL - motor1_speed_rpm, dt);
