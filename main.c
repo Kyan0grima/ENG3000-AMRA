@@ -34,7 +34,7 @@
 #define CTRL_BIT   PD6  //D6
 
 
-int MAX_SPEED = 800; /* rpm ceiling - do not exceed */
+int MAX_SPEED = 300; /* rpm ceiling - do not exceed */
 
 
 int turnCounter = 0;
