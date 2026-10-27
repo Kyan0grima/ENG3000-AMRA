@@ -1,5 +1,34 @@
-main save
-
+/*
+ * Line follower: map lap + map-based following.
+ *
+ * HOW IT WORKS
+ *   1. FIND_START : drive slowly on the sensor until the first start-of-straight
+ *                   marker (all 8 sensors dark) is seen.
+ *   2. MAPPING    : one full lap at MAP_SPEED_RPM, sensor-steered. The track is
+ *                   cut into MARKS_PER_LAP segments (marker -> next marker). Each
+ *                   segment is stored as a list of BIN_MM bins holding the
+ *                   curvature the wheels actually drove (from encoder L/R
+ *                   difference). The lap ends when the first marker is seen again.
+ *   3. Profile    : curvature -> speed per bin (lateral-accel limit, then a
+ *                   braking pass and an acceleration pass around the closed loop).
+ *   4. RUN        : every later lap steers by feed-forward from the map
+ *                   (curvature at the lookahead point), runs the stored speed
+ *                   profile, and uses the line sensor only as a limited trim
+ *                   (speed-scaled, see TRIM_LIMIT_*). Position along the map is
+ *                   (segment, distance since last marker); every marker re-syncs
+ *                   it, and a missed marker is dead-reckoned past.
+ *
+ * Curvature sign: positive = left turn (right wheel faster), same as the old
+ * "positive error = line on the left" convention.
+ *
+ * CHANGES IN THIS VERSION
+ *   - Fixed ~4 ms control loop (was ~27 ms: 20 ms delay + sensor + blocking printf).
+ *   - printf throttled (every PRINT_EVERY loops) and off in RUN by default.
+ *   - SPEED_CAP for stepping the run speed up gradually.
+ *   - Map cleanup: SMOOTH_PASSES smoothing passes + CURV_DEADBAND so straights stay straight.
+ *   - More conservative A_LAT / A_BRAKE defaults (measure A_BRAKE for your car!).
+ *   - Line trim limit scales with speed; separate run-mode line gains.
+ */
 
 #ifndef F_CPU
 #define F_CPU 16000000UL
@@ -14,6 +43,7 @@ main save
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
 #include "encoder.h"
 
 
@@ -34,11 +64,27 @@ main save
 #define CTRL_BIT   PD6  //D6
 
 
-int MAX_SPEED    = 650; /* rpm ceiling - do not exceed */
-int TARGET_SPEED = 650; /* current target rpm (ramped by decel()) */
+#define MAX_SPEED 800          /* rpm ceiling, per wheel */
 
-int turnCounter = 0;
-int lap = 1;
+/* ---- Loop timing / debug output (NEW) ---- */
+#define LOOP_PERIOD_US    4000UL   /* fixed control period. Sensor read takes up to 2.5 ms,
+                                    * so keep this >= ~4000 or the loop just free-runs.      */
+#define PRINT_EVERY       10       /* print once per N loops                                 */
+#define PRINT_IN_RUN      0        /* 1 = also print during MODE_RUN (costs ~4 ms per print) */
+
+/* ---- Wheel-speed measurement window (NEW) ----
+ * The encoder speed estimate is quantised: over a short window it is only a few
+ * ticks, so rpm jumps around and the speed PID (kp 1.4) turns that into PWM chatter.
+ * Measure speed over LOOP_PERIOD_US * SPEED_UPDATE_EVERY (= 20 ms, same as the old
+ * loop) and hold it in between. Distances are still updated every loop. */
+#define SPEED_UPDATE_EVERY 5
+
+/* ---- Run-speed cap (NEW) ----
+ * Step this up: 200 -> 300 -> 400 -> 500 -> MAX_SPEED (= uncapped).
+ * Note where on the track it first leaves the line. */
+#define SPEED_CAP         850.0f
+
+int lap = 1;                   /* 1 = mapping lap, 2+ = map laps */
 int checkpoint = 0;
 
 /* ======================= Sensors ================================ */
@@ -283,83 +329,215 @@ static float clampf(float v, float lo, float hi) {
     return v;
 }
 
-static void decel(float triggerDist, float decelDist, float minSpeed, float startSpeed) {
-    float into = car_dist_mm - triggerDist;
-    if (into <= 0.0f) return;
-    if (into >= decelDist) {            /* past the zone: hold the final speed */
-        TARGET_SPEED = (int)minSpeed;
-        return;
-    }
-    float frac = into / decelDist;      /* 0 at trigger, 1 at end of zone */
-    TARGET_SPEED = (int)clampf(startSpeed + (minSpeed - startSpeed) * frac,
-                               minSpeed, (float)MAX_SPEED);
-}
-
 
 /* ---- Outer loop: line position -> steering correction (rpm) ---
- * Setpoint is always 0. Units are wheel rpm. TUNE on the real robot.
- * 700 rpm of correction against an 800 rpm ceiling is very aggressive;
- * consider lowering LINE_CORRECTION_LIMIT. */
-#define LINE_KP                1.3f
-#define LINE_KI                3.2f
-#define LINE_KD                2.0f
-#define LINE_INTEGRAL_LIMIT    800.0f
-#define LINE_CORRECTION_LIMIT  700.0f
+ * Mapping lap: full authority with LINE_KP/LINE_KD.
+ * Run laps:    limited trim on top of the map feed-forward, with its own
+ *              gains (LINE_RUN_*) so the two can be tuned independently. */
+#define LINE_KP                0.03f
+#define LINE_KI                0.0f
+#define LINE_KD                0.000f
+#define LINE_INTEGRAL_LIMIT    500.0f
+#define LINE_CORRECTION_LIMIT  800.0f
+
+#define LINE_RUN_KP            0.06f     /* TUNE: run-mode trim gains (start equal to mapping) */
+#define LINE_RUN_KD            0.006f
 
 static pid_ctrl_t linePID = { LINE_KP, LINE_KI, LINE_KD, 0.0f, LINE_INTEGRAL_LIMIT, 0.0f };
 
 /* ---- Inner loop: per-wheel speed (rpm) -> PWM duty (0-255) ----
- * Integral limit ~ 255 / KI so the integral can't wind up past what the
- * PWM output can actually use. */
-#define SPEED_KP               1.0f
-#define SPEED_KI               3.0f
+ * Gain-scheduled ki, ported from MATLAB:
+ *   P.L.pid = struct('kp',1.4,'ki',(2.4 - 0.00325*(REF_L - 300)),'kd',0,'limit',100)
+ * The schedule is evaluated from each wheel's target speed (ref). */
+#define SPEED_KP               1.4f
 #define SPEED_KD               0.0f
-#define SPEED_INTEGRAL_LIMIT   150.0f
+#define SPEED_KI_BASE          2.4f
+#define SPEED_KI_SLOPE         0.00325f
+#define SPEED_KI_REF           300.0f
+#define SPEED_KI_MIN           1.0f      /* sanity clamps: only active outside ~0-730 rpm */
+#define SPEED_KI_MAX           3.4f
+#define SPEED_INTEGRAL_LIMIT   100.0f
 
-static pid_ctrl_t speedPID_L = { SPEED_KP, SPEED_KI, SPEED_KD, 0.0f, SPEED_INTEGRAL_LIMIT, 0.0f };
-static pid_ctrl_t speedPID_R = { SPEED_KP, SPEED_KI, SPEED_KD, 0.0f, SPEED_INTEGRAL_LIMIT, 0.0f };
-
-
-#define DEG2RAD  0.0174533f
-
-/* Must be placed AFTER the linePID definition (or forward-declare linePID),
- * because it calls pid_reset(&linePID). */
-static void turn(float triggerDist, float radius, float speed, int dir, float angle,
-                 float *leftSpeed, float *rightSpeed) {
-    static uint8_t turning = 0;
-    static float startL, startR;
-
-    if (car_dist_mm <= triggerDist) return;
-
-    if (!turning) {                       /* first loop of the turn */
-        turning = 1;
-        startL = (float)motor1_dist_mm;   /* motor1 = left (assumed) */
-        startR = (float)motor2_dist_mm;   /* motor2 = right (assumed) */
-        pid_reset(&linePID);              /* drop stale integral */
-    }
-
-    float dL = (float)motor1_dist_mm - startL;
-    float dR = (float)motor2_dist_mm - startR;
-
-    /* dir 0 = right turn: left wheel is outer, so it travels further */
-    float heading = ((dir == 0) ? (dL - dR) : (dR - dL)) / 90.4f;   /* radians */
-
-    if (heading >= angle * DEG2RAD) {     /* turn complete */
-        turning = 0;
-        turnCounter++;
-        pid_reset(&linePID);
-        return;
-    }
-
-    float ratio = (2.0f * radius - 90.4f) / (2.0f * radius + 90.4f);
-    if (ratio < 0.0f) ratio = 0.0f;
-
-    if (dir == 0) { *leftSpeed = speed;         *rightSpeed = speed * ratio; }
-    else          { *rightSpeed = speed;        *leftSpeed  = speed * ratio; }
-
-    *leftSpeed  = clampf(*leftSpeed,  0.0f, 900.0f);
-    *rightSpeed = clampf(*rightSpeed, 0.0f, 900.0f);
+static float speed_ki(float ref_rpm) {
+    float ki = SPEED_KI_BASE - SPEED_KI_SLOPE * (ref_rpm - SPEED_KI_REF);
+    return clampf(ki, SPEED_KI_MIN, SPEED_KI_MAX);
 }
+
+static pid_ctrl_t speedPID_L = { SPEED_KP, SPEED_KI_BASE, SPEED_KD, 0.0f, SPEED_INTEGRAL_LIMIT, 0.0f };
+static pid_ctrl_t speedPID_R = { SPEED_KP, SPEED_KI_BASE, SPEED_KD, 0.0f, SPEED_INTEGRAL_LIMIT, 0.0f };
+
+
+/* ======================= Track map ================================== */
+/* ---- Geometry ---- */
+#define TRACK_W_MM        90.4f                          /* wheel to wheel */
+#define WHEEL_D_MM        43.0f
+#define K_RPM_TO_MMS      (3.14159265f * WHEEL_D_MM / 60.0f)   /* mm/s per rpm (~2.25) */
+
+/* ---- Map storage ---- */
+#define MARKS_PER_LAP     5          /* start-of-straight markers per lap = segments */
+#define BIN_MM            20.0f      /* map resolution along the track               */
+#define MAX_BINS          320        /* 6.4 m of track; MQ Racer lap is ~5.3 m       */
+#define CURV_UNIT         0.0002f    /* 1/mm per int8 count (1 count = 1 encoder-tick difference per bin) */
+#define SPEED_UNIT_RPM    4.0f       /* speedMap is uint8 in units of 4 rpm          */
+
+/* ---- Map cleanup (NEW, TUNE) ---- */
+#define SMOOTH_PASSES     2          /* number of [1 2 1]/4 passes (each blurs corner entries a bit) */
+#define CURV_DEADBAND     3          /* |count| below this -> 0 (3 counts = 0.0006 1/mm, R > 1.6 m)  */
+
+/* ---- Mapping lap ---- */
+#define MAP_SPEED_RPM     180.0f     /* slow enough that a 20 mm marker is never skipped between loops */
+#define MIN_MARKER_GAP_MM 150.0f     /* ignore marker re-triggers closer than this   */
+#define CHECKPOINT_SUM    16000      /* sum of darkness that means "marker"          */
+
+/* ---- Speed profile (TUNE) ----
+ * A_LAT lowered from 5000 (try 2500-3000). A_BRAKE must reflect what the car
+ * REALLY achieves: duty is clamped >= 0 so the car only coasts when the target
+ * drops. Measure the coast-down rate from full speed and put it here. */
+#define A_LAT_MM_S2       3000.0f    /* cornering grip budget                        */
+#define A_BRAKE_MM_S2     1400.0f    /* braking into corners (MEASURE THIS)          */
+#define A_ACCEL_MM_S2     2800.0f    /* accelerating out of corners                  */
+#define MIN_SPEED_RPM     90.0f
+#define ACCEL_RPM_S       (A_ACCEL_MM_S2 / K_RPM_TO_MMS)   /* runtime base-speed rise rate */
+
+/* ---- Map following (TUNE) ---- */
+#define LOOKAHEAD_MM      98.0f      /* read the map this far ahead (motor/steer lag) */
+#define TRIM_LIMIT_MIN    900.0f     /* max line trim (rpm) at low speed             */
+#define TRIM_LIMIT_MAX    900.0f     /* max line trim (rpm) at MAX_SPEED             */
+#define MISS_MARGIN_MM    150.0f     /* past segment end by this much -> marker missed */
+#define LOST_STOP_MM      500.0f     /* stop if the line is lost for this far        */
+#define STOP_AFTER_LAP    0          /* 0 = run forever, N = stop after lap N        */
+
+static int8_t   curvMap[MAX_BINS];   /* signed curvature, + = left                   */
+static uint8_t  speedMap[MAX_BINS];  /* centreline speed in SPEED_UNIT_RPM           */
+static uint16_t nBins = 0;
+static uint16_t segStart[MARKS_PER_LAP];
+static uint16_t segBins[MARKS_PER_LAP];
+static float    segLen[MARKS_PER_LAP];   /* measured marker-to-marker length (mm)    */
+
+static uint8_t  seg = 0;             /* current segment                              */
+static float    segDist = 0.0f;      /* mm since the last marker                     */
+
+/* mapping accumulators */
+static float    binDist = 0.0f, binL = 0.0f, binR = 0.0f;
+static uint8_t  mapFailed = 0;
+
+typedef enum { MODE_FIND_START = 0, MODE_MAPPING, MODE_RUN, MODE_SENSOR_ONLY } run_mode_t;
+
+static float rampSpeed = 0.0f;       /* rate-limited base speed */
+
+
+/* Feed one loop of motion into the map while mapping. */
+static void map_record(float dCar, float dL, float dR) {
+    binDist += dCar;
+    binL    += dL;
+    binR    += dR;
+
+    while (binDist >= BIN_MM) {
+        if (nBins >= MAX_BINS) {                 /* track longer than the buffer */
+            mapFailed = 1;
+            binDist = binL = binR = 0.0f;
+            return;
+        }
+        float f      = BIN_MM / binDist;         /* fraction of the accumulated motion that belongs to this bin */
+        float kappa  = ((binR - binL) * f / TRACK_W_MM) / BIN_MM;   /* 1/mm, + = left */
+        float u      = kappa / CURV_UNIT;
+        int16_t q    = (int16_t)(u + (u >= 0.0f ? 0.5f : -0.5f));
+        if (q >  127) q =  127;
+        if (q < -127) q = -127;
+        curvMap[nBins++] = (int8_t)q;
+
+        binDist -= BIN_MM;
+        binL    *= (1.0f - f);
+        binR    *= (1.0f - f);
+    }
+}
+
+/* Called when a marker ends the current segment during mapping. */
+static void map_close_segment(void) {
+    segBins[seg] = nBins - segStart[seg];
+    segLen[seg]  = segDist;
+    seg++;
+    binDist = binL = binR = 0.0f;
+    if (seg < MARKS_PER_LAP) segStart[seg] = nBins;
+}
+
+/* Smooth curvature, remove tiny curvature, then build the speed profile around the closed loop. */
+static void map_finalize(void) {
+    /* 1) [1 2 1]/4 smoothing inside each segment (removes line-wobble noise),
+     *    repeated SMOOTH_PASSES times. */
+    for (uint8_t p = 0; p < SMOOTH_PASSES; p++) {
+        for (uint8_t s = 0; s < MARKS_PER_LAP; s++) {
+            uint16_t a = segStart[s], n = segBins[s];
+            if (n < 3) continue;
+            int16_t prev = curvMap[a];
+            for (uint16_t i = a + 1; i < a + n - 1; i++) {
+                int16_t cur = curvMap[i];
+                curvMap[i] = (int8_t)((prev + 2 * cur + curvMap[i + 1] + 2) >> 2);
+                prev = cur;
+            }
+        }
+    }
+
+    /* 1b) deadband: near-zero curvature is wobble, not track, so keep straights straight.
+     *     Done before the speed limit so straights get full speed. */
+    for (uint16_t i = 0; i < nBins; i++) {
+        if (abs((int)curvMap[i]) < CURV_DEADBAND) curvMap[i] = 0;
+    }
+
+    /* 2) per-bin speed limit from curvature */
+    for (uint16_t i = 0; i < nBins; i++) {
+        int16_t c = curvMap[i];
+        if (c < 0) c = -c;
+        float k = (float)c * CURV_UNIT;
+
+        /* outer wheel = v * (1 + k*W/2) must stay under MAX_SPEED */
+        float v = (float)MAX_SPEED / (1.0f + k * TRACK_W_MM * 0.5f);
+        if (k > 1.0e-4f) {
+            float vlat = sqrtf(A_LAT_MM_S2 / k) / K_RPM_TO_MMS;
+            if (vlat < v) v = vlat;
+        }
+        v = clampf(v, MIN_SPEED_RPM, (float)MAX_SPEED);
+        speedMap[i] = (uint8_t)(v / SPEED_UNIT_RPM);
+    }
+
+    /* 3) braking pass (backwards) and acceleration pass (forwards), twice so
+     *    the limit propagates across the lap wrap. v^2 domain, in speed units. */
+    const float k2   = K_RPM_TO_MMS * K_RPM_TO_MMS * SPEED_UNIT_RPM * SPEED_UNIT_RPM;
+    const float kb   = 2.0f * A_BRAKE_MM_S2 * BIN_MM / k2;
+    const float ka   = 2.0f * A_ACCEL_MM_S2 * BIN_MM / k2;
+
+    for (uint8_t pass = 0; pass < 2; pass++) {
+        for (int16_t i = (int16_t)nBins - 1; i >= 0; i--) {
+            uint16_t nx = (uint16_t)(i + 1 >= (int16_t)nBins ? 0 : i + 1);
+            float vn  = (float)speedMap[nx];
+            float lim = vn * vn + kb;
+            float vi  = (float)speedMap[i];
+            if (vi * vi > lim) speedMap[i] = (uint8_t)sqrtf(lim);
+        }
+        for (uint16_t i = 0; i < nBins; i++) {
+            uint16_t pv = (i == 0) ? (nBins - 1) : (i - 1);
+            float vp  = (float)speedMap[pv];
+            float lim = vp * vp + ka;
+            float vi  = (float)speedMap[i];
+            if (vi * vi > lim) speedMap[i] = (uint8_t)sqrtf(lim);
+        }
+    }
+}
+
+/* Map position (segment s, distance d into it) -> flat bin index.
+ * d may run past the end of the segment (lookahead); it rolls into the next. */
+static uint16_t map_index(uint8_t s, float d) {
+    for (uint8_t guard = 0; guard < MARKS_PER_LAP; guard++) {
+        float len = (float)segBins[s] * BIN_MM;
+        if (d < len) break;
+        d -= len;
+        s = (s + 1 >= MARKS_PER_LAP) ? 0 : (uint8_t)(s + 1);
+    }
+    uint16_t b = (uint16_t)(d / BIN_MM);
+    if (b >= segBins[s]) b = segBins[s] - 1;
+    return segStart[s] + b;
+}
+
 
 /* ======================= Main ======================================= */
 int main(void) {
@@ -382,10 +560,21 @@ int main(void) {
     pid_reset(&linePID);
     pid_reset(&speedPID_L);
     pid_reset(&speedPID_R);
+    rampSpeed = 0.0f;
+
+    run_mode_t mode = MODE_FIND_START;
+    run_mode_t prevMode = mode;
 
     uint32_t last_loop_time  = micros();
-    uint32_t checkpointDebounce = micros();
     uint32_t last_speed_time = last_loop_time;
+
+    float lastCar = (float)car_dist_mm;
+    float lastM1  = (float)motor1_dist_mm;     /* motor1 = left  */
+    float lastM2  = (float)motor2_dist_mm;     /* motor2 = right */
+    float lostDist = 0.0f;
+    uint16_t idx = 0;
+    uint8_t printDiv = 0;
+    uint8_t speedDiv = 0;
 
     for (;;) {
         uint32_t now = micros();
@@ -397,58 +586,154 @@ int main(void) {
         int32_t error = computeLinePosition();
         lastError = error;
 
-        update_motor_speeds(now - last_speed_time);
-        last_speed_time = now;
+        if (++speedDiv >= SPEED_UPDATE_EVERY) {
+            speedDiv = 0;
+            update_motor_speeds(now - last_speed_time);
+            last_speed_time = now;
+        }
         update_motor_distances();
 
-        if ((now - checkpointDebounce) > 400000){
-            if (sum>10000){
+        /* --- motion since last loop --- */
+        float carNow = (float)car_dist_mm;
+        float m1Now  = (float)motor1_dist_mm;
+        float m2Now  = (float)motor2_dist_mm;
+        float dCar = carNow - lastCar;
+        float dL   = m1Now  - lastM1;
+        float dR   = m2Now  - lastM2;
+        lastCar = carNow; lastM1 = m1Now; lastM2 = m2Now;
+
+        segDist += dCar;
+
+        uint8_t onMarker = (sum > CHECKPOINT_SUM);
+        uint8_t lost     = (sum < 300);
+        lostDist = lost ? (lostDist + dCar) : 0.0f;
+
+        /* --- mode / map state machine --- */
+        switch (mode) {
+        case MODE_FIND_START:
+            if (onMarker) {
                 checkpoint++;
-                checkpointDebounce = micros();
+                nBins = 0;
+                seg = 0;
+                segStart[0] = 0;
+                segDist = 0.0f;
+                binDist = binL = binR = 0.0f;
+                mapFailed = 0;
+                mode = MODE_MAPPING;
             }
+            break;
+
+        case MODE_MAPPING:
+            map_record(dCar, dL, dR);
+            if (onMarker && segDist >= MIN_MARKER_GAP_MM) {
+                checkpoint++;
+                map_close_segment();
+                segDist = 0.0f;
+                if (seg >= MARKS_PER_LAP) {            /* back at the first marker: lap done */
+                    if (mapFailed) {
+                        mode = MODE_SENSOR_ONLY;       /* map unusable: keep following the sensor */
+                    } else {
+                        map_finalize();
+                        seg = 0;
+                        lap = 2;
+                        mode = MODE_RUN;
+                    }
+                }
+            }
+            break;
+
+        case MODE_RUN: {
+            float len = segLen[seg];
+            uint8_t advance = 0;
+            if (onMarker && segDist >= 0.5f * len) {   /* real marker: re-sync */
+                checkpoint++;
+                segDist = 0.0f;
+                advance = 1;
+            } else if (segDist > len + MISS_MARGIN_MM) { /* marker missed: dead-reckon past it */
+                segDist -= len;
+                advance = 1;
+            }
+            if (advance) {
+                seg++;
+                if (seg >= MARKS_PER_LAP) { seg = 0; lap++; }
+            }
+        } break;
+
+        case MODE_SENSOR_ONLY:
+        default:
+            break;
         }
 
-
-        /* --- Outer loop: line position -> steering correction --- */
+        /* --- Outer loop: line position -> steering correction ---
+         * Gains differ between mapping and run; reset the PID on a mode change
+         * so stale integral/derivative state is not carried over. */
+        if (mode != prevMode) {
+            pid_reset(&linePID);
+            prevMode = mode;
+        }
+        linePID.kp = (mode == MODE_RUN) ? LINE_RUN_KP : LINE_KP;
+        linePID.kd = (mode == MODE_RUN) ? LINE_RUN_KD : LINE_KD;
         float correction = pid_update(&linePID, (float)error, dt);
-        correction = clampf(correction, -LINE_CORRECTION_LIMIT, LINE_CORRECTION_LIMIT);
 
-        if (turnCounter == 0) {
-            decel(80, 200, 200, MAX_SPEED);
+        float goal;                    /* desired centreline speed (rpm) */
+        float ff   = 0.0f;             /* feed-forward differential, = kappa * W / 2 */
+        float trim;
+
+        if (mode == MODE_RUN) {
+            idx  = map_index(seg, segDist + LOOKAHEAD_MM);
+            goal = (float)speedMap[idx] * SPEED_UNIT_RPM;
+            if (goal > SPEED_CAP) goal = SPEED_CAP;
+            ff   = (float)curvMap[idx] * CURV_UNIT * TRACK_W_MM * 0.5f;
+
+            /* trim authority grows with speed: more correction needed when fast */
+            float trimLimit = TRIM_LIMIT_MIN +
+                (TRIM_LIMIT_MAX - TRIM_LIMIT_MIN) * (rampSpeed / (float)MAX_SPEED);
+            /* sensor is only a trim; ignore it when the line is lost */
+            trim = lost ? 0.0f : clampf(correction, -trimLimit, trimLimit);
+        } else {
+            goal = MAP_SPEED_RPM;
+            trim = clampf(correction, -LINE_CORRECTION_LIMIT, LINE_CORRECTION_LIMIT);
         }
-        if (car_dist_mm > 800){
-            TARGET_SPEED = MAX_SPEED;
+
+        if (lostDist > LOST_STOP_MM)                        goal = 0.0f;
+        if (STOP_AFTER_LAP > 0 && lap > STOP_AFTER_LAP)     goal = 0.0f;
+
+        /* --- Accel ramp: rises at ACCEL_RPM_S, falls immediately --- */
+        {
+            float rise = rampSpeed + ACCEL_RPM_S * dt;
+            rampSpeed = (goal < rise) ? goal : rise;
         }
+        float base = rampSpeed;
 
-        /* turnCounter == 1: do nothing, TARGET_SPEED holds at 200 */
+        trim = clampf(trim, -base, base);
 
-        correction = clampf(correction, -(float)TARGET_SPEED, (float)TARGET_SPEED);
-
-        float targetL = clampf((float)TARGET_SPEED - correction, 0.0f, (float)MAX_SPEED);
-        float targetR = clampf((float)TARGET_SPEED + correction, 0.0f, (float)MAX_SPEED);
-
-        // /* --- 3. Arcs --- */
-        // if (turnCounter == 0 && checkpoint == 2) {
-        //     turn(0.0f, 100.0f, (float)TARGET_SPEED, 1, 75.0f, &targetL, &targetR);  /* left */
-        // }
-        // else if (turnCounter == 1 && checkpoint == 2) {
-        //     turn(0.0f,   100.0f, (float)TARGET_SPEED, 0, 75.0f, &targetL, &targetR);  /* right */
-        // }
-
+        float targetL = clampf(base * (1.0f - ff) - trim, 0.0f, (float)MAX_SPEED);
+        float targetR = clampf(base * (1.0f + ff) + trim, 0.0f, (float)MAX_SPEED);
 
 
         /* --- Inner loop: target speed -> PWM duty, per wheel --- */
+        speedPID_L.ki = speed_ki(targetL);   /* gain-scheduled ki (from MATLAB) */
+        speedPID_R.ki = speed_ki(targetR);
+
         float dutyL = pid_update(&speedPID_L, targetL - motor1_speed_rpm, dt);
         float dutyR = pid_update(&speedPID_R, targetR - motor2_speed_rpm, dt);
 
-        uint8_t pwmL = (uint8_t)clampf(dutyL, 0.0f, 255.0f);
-        uint8_t pwmR = (uint8_t)clampf(dutyR, 0.0f, 255.0f);
+        uint8_t pwmL = (uint8_t)clampf(dutyL, 0.0f, 200.0f);
+        uint8_t pwmR = (uint8_t)clampf(dutyR, 0.0f, 200.0f);
 
-        //forward(pwmL, pwmR);
+        forward(pwmL, pwmR);
 
-        printf("speed: %d \tspeed2: %d \terror: %d \tdist: %d \tcheck: %d \n",
-               (int)motor1_speed_rpm, (int)motor2_speed_rpm, (int)error, (int)car_dist_mm, (int)checkpoint);
+        /* --- Throttled debug print (a blocking printf costs ~4 ms) --- */
+        if (mode != MODE_RUN || PRINT_IN_RUN) {
+            if (++printDiv >= PRINT_EVERY) {
+                printDiv = 0;
+                printf("m:%d lap:%d seg:%d d:%d err:%d base:%d chk:%d \n",
+                       (int)mode, lap, (int)seg, (int)segDist, (int)error,
+                       (int)base, (int)checkpoint);
+            }
+        }
 
-        _delay_ms(20);
+        /* --- Fixed loop period (replaces _delay_ms(20)) --- */
+        while ((micros() - now) < LOOP_PERIOD_US) { }
     }
 }
