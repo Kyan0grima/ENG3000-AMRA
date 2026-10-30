@@ -64,7 +64,7 @@
 #define CTRL_BIT   PD6  //D6
 
 
-#define MAX_SPEED 800          /* rpm ceiling, per wheel */
+#define MAX_SPEED 900          /* rpm ceiling, per wheel */
 
 /* ---- Loop timing / debug output (NEW) ---- */
 #define LOOP_PERIOD_US    4000UL   /* fixed control period. Sensor read takes up to 2.5 ms,
@@ -82,7 +82,7 @@
 /* ---- Run-speed cap (NEW) ----
  * Step this up: 200 -> 300 -> 400 -> 500 -> MAX_SPEED (= uncapped).
  * Note where on the track it first leaves the line. */
-#define SPEED_CAP         850.0f
+#define SPEED_CAP         900.0f
 
 int lap = 1;                   /* 1 = mapping lap, 2+ = map laps */
 int checkpoint = 0;
@@ -340,8 +340,8 @@ static float clampf(float v, float lo, float hi) {
 #define LINE_INTEGRAL_LIMIT    500.0f
 #define LINE_CORRECTION_LIMIT  800.0f
 
-#define LINE_RUN_KP            0.06f     /* TUNE: run-mode trim gains (start equal to mapping) */
-#define LINE_RUN_KD            0.006f
+#define LINE_RUN_KP            0.07f     /* TUNE: run-mode trim gains (start equal to mapping) */
+#define LINE_RUN_KD            0.004f
 
 static pid_ctrl_t linePID = { LINE_KP, LINE_KI, LINE_KD, 0.0f, LINE_INTEGRAL_LIMIT, 0.0f };
 
@@ -381,26 +381,26 @@ static pid_ctrl_t speedPID_R = { SPEED_KP, SPEED_KI_BASE, SPEED_KD, 0.0f, SPEED_
 #define SPEED_UNIT_RPM    4.0f       /* speedMap is uint8 in units of 4 rpm          */
 
 /* ---- Map cleanup (NEW, TUNE) ---- */
-#define SMOOTH_PASSES     2          /* number of [1 2 1]/4 passes (each blurs corner entries a bit) */
+#define SMOOTH_PASSES     3          /* number of [1 2 1]/4 passes (each blurs corner entries a bit) */
 #define CURV_DEADBAND     3          /* |count| below this -> 0 (3 counts = 0.0006 1/mm, R > 1.6 m)  */
 
 /* ---- Mapping lap ---- */
 #define MAP_SPEED_RPM     180.0f     /* slow enough that a 20 mm marker is never skipped between loops */
 #define MIN_MARKER_GAP_MM 150.0f     /* ignore marker re-triggers closer than this   */
-#define CHECKPOINT_SUM    16000      /* sum of darkness that means "marker"          */
+#define CHECKPOINT_SUM    13000      /* sum of darkness that means "marker"          */
 
 /* ---- Speed profile (TUNE) ----
  * A_LAT lowered from 5000 (try 2500-3000). A_BRAKE must reflect what the car
  * REALLY achieves: duty is clamped >= 0 so the car only coasts when the target
  * drops. Measure the coast-down rate from full speed and put it here. */
-#define A_LAT_MM_S2       3000.0f    /* cornering grip budget                        */
-#define A_BRAKE_MM_S2     1400.0f    /* braking into corners (MEASURE THIS)          */
-#define A_ACCEL_MM_S2     2800.0f    /* accelerating out of corners                  */
-#define MIN_SPEED_RPM     90.0f
+#define A_LAT_MM_S2       3400.0f    /* cornering grip budget                        */
+#define A_BRAKE_MM_S2     2000.0f    /* braking into corners (MEASURE THIS)          */
+#define A_ACCEL_MM_S2     3400.0f    /* accelerating out of corners                  */
+#define MIN_SPEED_RPM     50.0f
 #define ACCEL_RPM_S       (A_ACCEL_MM_S2 / K_RPM_TO_MMS)   /* runtime base-speed rise rate */
 
 /* ---- Map following (TUNE) ---- */
-#define LOOKAHEAD_MM      98.0f      /* read the map this far ahead (motor/steer lag) */
+#define LOOKAHEAD_MM      115.0f      /* read the map this far ahead (motor/steer lag) */
 #define TRIM_LIMIT_MIN    900.0f     /* max line trim (rpm) at low speed             */
 #define TRIM_LIMIT_MAX    900.0f     /* max line trim (rpm) at MAX_SPEED             */
 #define MISS_MARGIN_MM    150.0f     /* past segment end by this much -> marker missed */
